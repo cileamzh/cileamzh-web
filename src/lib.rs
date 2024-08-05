@@ -2,46 +2,77 @@ use std::{
     collections::HashMap,
     io::{Read, Result, Write},
     net::{TcpListener, TcpStream},
+    sync::Arc,
     thread::spawn,
 };
 
+type Handler = dyn Fn(&mut HttpRequest, &mut HttpResponse) + Send + Sync + 'static;
+type Middleware = dyn Fn(&mut HttpRequest, &mut HttpResponse) + Send + Sync + 'static;
+
 pub struct Server {
     listener: TcpListener,
-    routers: HashMap<(String, String), fn(HttpRequest, HttpResponse)>,
-    middlewares: Vec<fn(HttpRequest, HttpResponse) -> (HttpRequest, HttpResponse)>,
+    routers: Arc<HashMap<(String, String), Arc<Handler>>>,
+    middlewares: Arc<Vec<Arc<Middleware>>>,
 }
 
 impl Server {
     pub fn new(path: &str) -> Result<Self> {
-        let tcplst = TcpListener::bind(path)?;
+        let listener = TcpListener::bind(path)?;
         Ok(Server {
-            listener: tcplst,
-            routers: HashMap::new(),
-            middlewares: Vec::new(),
+            listener,
+            routers: Arc::new(HashMap::new()),
+            middlewares: Arc::new(Vec::new()),
         })
     }
 
     pub fn run(self) -> Result<()> {
         for stream in self.listener.incoming() {
-            let stream = stream.unwrap();
-            let routers = self.routers.clone();
-            let middlewares = self.middlewares.clone();
-            spawn(move || {
-                handle_stream(stream, routers, middlewares).unwrap();
-            });
+            match stream {
+                Ok(stream) => {
+                    let routers = Arc::clone(&self.routers);
+                    let middlewares = Arc::clone(&self.middlewares);
+                    spawn(move || {
+                        if let Err(e) = handle_stream(stream, routers, middlewares) {
+                            eprintln!("Error handling stream: {}", e);
+                        }
+                    });
+                }
+                Err(e) => eprintln!("Connection failed: {}", e),
+            }
         }
         Ok(())
     }
 
-    pub fn add_route(&mut self, method: &str, path: &str, handler: fn(HttpRequest, HttpResponse)) {
-        self.routers
-            .insert((method.to_string(), path.to_string()), handler);
+    pub fn add_route<F>(&mut self, method: &str, path: &str, handler: F)
+    where
+        F: Fn(&mut HttpRequest, &mut HttpResponse) + Send + Sync + 'static,
+    {
+        Arc::get_mut(&mut self.routers)
+            .unwrap()
+            .insert((method.to_string(), path.to_string()), Arc::new(handler));
     }
-    pub fn add_midware(
-        &mut self,
-        middleware: fn(HttpRequest, HttpResponse) -> (HttpRequest, HttpResponse),
-    ) {
-        self.middlewares.push(middleware);
+
+    pub fn add_middleware<F>(&mut self, middleware: F)
+    where
+        F: Fn(&mut HttpRequest, &mut HttpResponse) + Send + Sync + 'static,
+    {
+        Arc::get_mut(&mut self.middlewares)
+            .unwrap()
+            .push(Arc::new(middleware));
+    }
+
+    pub fn add_get<F>(&mut self, path: &str, handler: F)
+    where
+        F: Fn(&mut HttpRequest, &mut HttpResponse) + Send + Sync + 'static,
+    {
+        self.add_route("GET", path, handler);
+    }
+
+    pub fn add_post<F>(&mut self, path: &str, handler: F)
+    where
+        F: Fn(&mut HttpRequest, &mut HttpResponse) + Send + Sync + 'static,
+    {
+        self.add_route("POST", path, handler);
     }
 }
 
@@ -55,8 +86,7 @@ pub struct HttpRequest {
 }
 
 impl HttpRequest {
-    pub fn from(stream: &mut TcpStream) -> Self {
-        let req_str = read_http(stream).unwrap();
+    pub fn from(req_str: String) -> Result<Self> {
         let mut headers: HashMap<String, String> = HashMap::new();
         let parts: Vec<&str> = req_str.split("\r\n\r\n").collect();
 
@@ -70,18 +100,13 @@ impl HttpRequest {
         let first_line_parts: Vec<&str> = request_lines[0].split_whitespace().collect();
 
         let method = first_line_parts[0].to_string();
-        let path = first_line_parts[1]
-            .to_string()
-            .split("?")
-            .nth(0)
-            .unwrap()
-            .to_string();
-        let params = first_line_parts[1]
-            .to_string()
-            .split("?")
-            .nth(1)
-            .unwrap()
-            .to_string();
+        let path_params: Vec<&str> = first_line_parts[1].split('?').collect();
+        let path = path_params[0].to_string();
+        let params = if path_params.len() > 1 {
+            path_params[1].to_string()
+        } else {
+            String::new()
+        };
         let protocol = first_line_parts[2].to_string();
 
         for line in &request_lines[1..] {
@@ -90,14 +115,14 @@ impl HttpRequest {
             }
         }
 
-        HttpRequest {
+        Ok(HttpRequest {
             params,
-            method,
             path,
+            method,
             protocol,
             headers,
             body,
-        }
+        })
     }
 
     pub fn get_body(&self) -> &str {
@@ -115,24 +140,26 @@ impl HttpRequest {
     pub fn get_header(&self, key: &str) -> Option<&String> {
         self.headers.get(key)
     }
-    pub fn get_ptotocol(&self) -> &str {
+
+    pub fn get_protocol(&self) -> &str {
         &self.protocol
     }
+
     pub fn get_params(&self) -> &str {
         &self.params
     }
 }
 
 pub struct HttpResponse {
-    stream: TcpStream,
+    status: String,
     headers: HashMap<String, String>,
     body: String,
 }
 
 impl HttpResponse {
-    pub fn new(stream: TcpStream) -> Self {
+    pub fn new() -> Self {
         HttpResponse {
-            stream,
+            status: "HTTP/1.1 200 OK".to_owned(),
             headers: HashMap::new(),
             body: String::new(),
         }
@@ -146,54 +173,58 @@ impl HttpResponse {
         self.headers.insert(key.to_string(), value.to_string());
     }
 
-    pub fn send(mut self) -> Result<()> {
-        let mut response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n", self.body.len());
+    pub fn set_status(&mut self, status: String) {
+        self.status = status;
+    }
+
+    pub fn get_string(&self) -> String {
+        let mut response = format!("{}\r\nContent-Length: {}\r\n", self.status, self.body.len());
         for (key, value) in &self.headers {
             response.push_str(&format!("{}: {}\r\n", key, value));
         }
         response.push_str("\r\n");
         response.push_str(&self.body);
-
-        self.stream.write_all(response.as_bytes())?;
-        self.stream.flush()?;
-        Ok(())
+        response
     }
 }
 
-pub fn handle_stream(
-    stream: TcpStream,
-    route: HashMap<(String, String), fn(HttpRequest, HttpResponse)>,
-    middlewares: Vec<fn(HttpRequest, HttpResponse) -> (HttpRequest, HttpResponse)>,
+fn handle_stream(
+    mut stream: TcpStream,
+    route: Arc<HashMap<(String, String), Arc<Handler>>>,
+    middlewares: Arc<Vec<Arc<Middleware>>>,
 ) -> Result<()> {
-    let mut stream_clone = stream.try_clone().unwrap();
-    let mut req = HttpRequest::from(&mut stream_clone);
-    let mut res = HttpResponse::new(stream);
+    let req_str = read_stream_to_httpstr(&stream)?;
+    let mut req = HttpRequest::from(req_str)?;
+    let mut res = HttpResponse::new();
 
-    for midware in middlewares {
-        (req, res) = midware(req, res);
+    for middleware in middlewares.iter() {
+        middleware(&mut req, &mut res);
     }
 
     let key = (req.get_method().to_string(), req.get_path().to_string());
     if let Some(handler) = route.get(&key) {
-        handler(req, res);
+        handler(&mut req, &mut res);
+        stream.write_all(res.get_string().as_bytes())?;
+        stream.flush()?;
     } else {
         res.set_body("404 Not Found");
         res.set_header("Content-Type", "text/plain");
-        res.send()?;
+        stream.write_all(res.get_string().as_bytes())?;
+        stream.flush()?;
     }
 
     Ok(())
 }
 
-fn read_http(mut stream: &TcpStream) -> Result<String> {
-    let mut buf: Vec<u8> = vec![0; 512];
-    let mut result: String = String::new();
+fn read_stream_to_httpstr(mut stream: &TcpStream) -> Result<String> {
+    let mut buf = vec![0; 512];
+    let mut result = String::new();
     loop {
         let read = stream.read(&mut buf)?;
-        result.push_str(&String::from_utf8_lossy(&buf[..read]));
         if read == 0 {
             break;
         }
+        result.push_str(&String::from_utf8_lossy(&buf[..read]));
         if read < buf.len() {
             break;
         }
