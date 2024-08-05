@@ -1,0 +1,3 @@
+fn show() {
+    println("{}", "show");
+}
