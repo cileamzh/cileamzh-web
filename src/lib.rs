@@ -8,7 +8,7 @@ use std::{
 pub struct Server {
     listener: TcpListener,
     routers: HashMap<(String, String), fn(HttpRequest, HttpResponse)>,
-    middleware: Vec<fn()>,
+    middlewares: Vec<fn(HttpRequest, HttpResponse) -> (HttpRequest, HttpResponse)>,
 }
 
 impl Server {
@@ -17,7 +17,7 @@ impl Server {
         Ok(Server {
             listener: tcplst,
             routers: HashMap::new(),
-            middleware: Vec::new(),
+            middlewares: Vec::new(),
         })
     }
 
@@ -25,8 +25,9 @@ impl Server {
         for stream in self.listener.incoming() {
             let stream = stream.unwrap();
             let routers = self.routers.clone();
+            let middlewares = self.middlewares.clone();
             spawn(move || {
-                handle_con(stream, routers).unwrap();
+                handle_stream(stream, routers, middlewares).unwrap();
             });
         }
         Ok(())
@@ -35,6 +36,12 @@ impl Server {
     pub fn add_route(&mut self, method: &str, path: &str, handler: fn(HttpRequest, HttpResponse)) {
         self.routers
             .insert((method.to_string(), path.to_string()), handler);
+    }
+    pub fn add_midware(
+        &mut self,
+        middleware: fn(HttpRequest, HttpResponse) -> (HttpRequest, HttpResponse),
+    ) {
+        self.middlewares.push(middleware);
     }
 }
 
@@ -153,13 +160,18 @@ impl HttpResponse {
     }
 }
 
-pub fn handle_con(
+pub fn handle_stream(
     stream: TcpStream,
     route: HashMap<(String, String), fn(HttpRequest, HttpResponse)>,
+    middlewares: Vec<fn(HttpRequest, HttpResponse) -> (HttpRequest, HttpResponse)>,
 ) -> Result<()> {
     let mut stream_clone = stream.try_clone().unwrap();
-    let req = HttpRequest::from(&mut stream_clone);
+    let mut req = HttpRequest::from(&mut stream_clone);
     let mut res = HttpResponse::new(stream);
+
+    for midware in middlewares {
+        (req, res) = midware(req, res);
+    }
 
     let key = (req.get_method().to_string(), req.get_path().to_string());
     if let Some(handler) = route.get(&key) {
