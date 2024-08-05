@@ -1,3 +1,0 @@
-fn show() {
-    println("{}", "show");
-}
