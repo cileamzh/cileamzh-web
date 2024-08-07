@@ -27,13 +27,12 @@ impl HttpResponse {
         self.status = status;
     }
 
-    pub fn get_string(&self) -> String {
+    pub fn get_header(&self) -> String {
         let mut response = format!("{}\r\nContent-Length: {}\r\n", self.status, self.body.len());
         for (key, value) in &self.headers {
             response.push_str(&format!("{}: {}\r\n", key, value));
         }
         response.push_str("\r\n");
-        response.push_str(&self.body);
         response
     }
 }

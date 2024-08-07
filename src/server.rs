@@ -111,11 +111,13 @@ fn handle_stream(
                         let contents = fs::read(&file_str).unwrap();
                         res.set_header("Content-Type", get_mime_type(&file_str));
                         res.set_body(&String::from_utf8_lossy(&contents));
-                        stream.write_all(res.get_string().as_bytes())?;
+                        stream.write(res.get_header().as_bytes())?;
+                        stream.write_all(&contents)?;
                         stream.flush()?
                     } else {
                         res.set_body("file not found");
-                        stream.write_all(res.get_string().as_bytes())?;
+                        stream.write(res.get_header().as_bytes())?;
+                        stream.write_all("file not found".as_bytes())?;
                         stream.flush()?
                     }
                 }
@@ -132,12 +134,12 @@ fn handle_stream(
     let key = (req.get_method().to_string(), req.get_path().to_string());
     if let Some(handler) = route.get(&key) {
         handler(&mut req, &mut res);
-        stream.write_all(res.get_string().as_bytes())?;
+        stream.write_all(res.get_header().as_bytes())?;
         stream.flush()?;
     } else {
         res.set_body("404 Not Found");
         res.set_header("Content-Type", "text/plain");
-        stream.write_all(res.get_string().as_bytes())?;
+        stream.write_all(res.get_header().as_bytes())?;
         stream.flush()?;
     }
 
